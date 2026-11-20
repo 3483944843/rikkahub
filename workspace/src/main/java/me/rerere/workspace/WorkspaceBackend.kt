@@ -101,18 +101,32 @@ data class WorkspaceLayout(
     }
 
     private companion object {
-        /** 消掉 . 和 .., 避免 /workspace/../x 这类路径绕过审批; 越过根目录时返回 null */
+        private val DRIVE_PREFIX = Regex("^[A-Za-z]:$")
+
+        /** 消掉 . 和 .., 避免 /workspace/../x 这类路径绕过审批; 越过根目录或不是绝对路径时返回 null */
         fun normalizeAbsolutePath(path: String): String? {
-            if (!path.startsWith("/")) return null
+            val normalized = path.replace('\\', '/').trim()
+            // `/C:/x` 和 `C:/x` 视为同一条路径, 与 normalizeAbsolute 的约定一致
+            val stripped = if (normalized.length > 1 && normalized[0] == '/' &&
+                DRIVE_PREFIX.matches(normalized.substring(1).substringBefore('/'))
+            ) {
+                normalized.substring(1)
+            } else {
+                normalized
+            }
+            val drive = stripped.substringBefore('/').takeIf { DRIVE_PREFIX.matches(it) }?.uppercase()
+            if (drive == null && !stripped.startsWith("/")) return null
+            val body = if (drive == null) stripped else stripped.substring(drive.length)
             val segments = ArrayDeque<String>()
-            path.split('/').forEach { segment ->
+            body.split('/').forEach { segment ->
                 when (segment) {
                     "", "." -> Unit
                     ".." -> segments.removeLastOrNull() ?: return null
                     else -> segments.addLast(segment)
                 }
             }
-            return segments.joinToString(separator = "/", prefix = "/")
+            val joined = segments.joinToString("/")
+            return if (drive == null) "/$joined" else "$drive/$joined"
         }
     }
 }

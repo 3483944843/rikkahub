@@ -205,10 +205,17 @@ internal class SshConnection private constructor(
     }
 
     private fun detectShell(): String {
-        val result = exec("command -v bash", SHELL_DETECT_TIMEOUT_MS)
-        // 用户的 rc 文件可能会往 stdout 打印内容, 只认最后一个绝对路径
-        val bash = result.stdout.lineSequence().map { it.trim() }.lastOrNull { it.startsWith("/") }
-        return if (result.exitCode == 0 && bash != null) bash else "/bin/sh"
+        // 探测命令也用"单 token + stdin": OpenSSH for Windows 会把 exec 命令行截断在第一个空格处,
+        // 直接发 `command -v bash` 到那边只剩下 `command`, 什么也查不到, 只能退回兜底 shell
+        val result = runCatching {
+            exec(FALLBACK_SHELL, SHELL_DETECT_TIMEOUT_MS, "command -v bash\n".toByteArray())
+        }.getOrNull() ?: return FALLBACK_SHELL
+        // 用户的 rc 文件可能会往 stdout 打印内容, 不能把整段输出当成路径:
+        // 先取最像 bash 的一行, 再退到"以 / 开头且不含空格"的一行 (rc 里的提示文本通常带空格),
+        // 都没有才用兜底的 POSIX shell
+        val candidates = result.stdout.lineSequence().map { it.trim() }.filter { it.startsWith("/") }.toList()
+        val bash = candidates.lastOrNull { BASH_PATH.matches(it) } ?: candidates.lastOrNull { !it.contains(' ') }
+        return if (result.exitCode == 0 && bash != null) bash else FALLBACK_SHELL
     }
 
     companion object {
@@ -218,6 +225,10 @@ internal class SshConnection private constructor(
         private const val KEEPALIVE_COUNT_MAX = 3
         private const val EXEC_POLL_INTERVAL_MS = 20L
         private const val SHELL_DETECT_TIMEOUT_MS = 15_000L
+        private const val FALLBACK_SHELL = "/bin/sh"
+
+        /** 探测结果里认得出的 bash 绝对路径, 允许 Windows 的 bash.exe */
+        private val BASH_PATH = Regex("^/\\S*/bash(\\.exe)?$")
         private const val TERMINAL_TYPE = "xterm-256color"
 
         // RFC 4254 的 PTY 模式编码: 开启 IUTF8 (RFC 8160 opcode 42), 让行编辑按 UTF-8 字符退格; 以 TTY_OP_END 结尾

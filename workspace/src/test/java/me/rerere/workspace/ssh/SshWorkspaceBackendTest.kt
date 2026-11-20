@@ -30,6 +30,7 @@ import java.io.File
 import java.util.Base64
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
@@ -48,8 +49,10 @@ class SshWorkspaceBackendTest {
     private val slowAuthEntered = CountDownLatch(1)
     private val slowAuthRelease = CountDownLatch(1)
 
-    // 收到带 SLOW_REPLY_MARKER 的命令后拖过客户端的 channel 超时才回应 exec 请求,
-    // 用来复现服务器已经接受命令、客户端却等回应超时
+    // 下一条命令 (exec 命令行只有一个词, 不带空格) 拖过客户端的 channel 超时才回应 exec 请求,
+    // 用来复现服务器已经接受命令、客户端却等回应超时。
+    // 命令文本现在走 stdin, 服务端在收到 exec 请求时看不到它, 所以用一次性开关而不是匹配命令内容。
+    private val delayNextExec = AtomicBoolean(false)
     private val slowReplyRequests = AtomicInteger()
 
     // 读取 SLOW_READ_FILE 时服务器一直不回应, 直到测试放行, 用来复现 SFTP 读取卡在网络上
@@ -116,8 +119,9 @@ class SshWorkspaceBackendTest {
                 },
             )
             commandFactory = CommandFactory { channel, command ->
-                // SSHD 在创建命令之后才回应 exec 请求, 在这里等待就能推迟回应
-                if (SLOW_REPLY_MARKER in command) {
+                // SSHD 在创建命令之后才回应 exec 请求, 在这里等待就能推迟回应。
+                // 只认不带空格的命令行: 那才是 executeCommand 发出的, detectShell 的探测命令带空格
+                if (!command.contains(' ') && delayNextExec.compareAndSet(true, false)) {
                     slowReplyRequests.incrementAndGet()
                     Thread.sleep(1_500)
                 }
@@ -329,7 +333,11 @@ class SshWorkspaceBackendTest {
     fun commandIsNotRerunWhenExecRequestTimesOut() {
         SshConnectionPool(channelTimeoutMillis = 500).use { slowPool ->
             val backend = backend(pool = slowPool)
+            // 先跑一条命令把连接建起来: detectShell 的探针同样是不带空格的命令行,
+            // 连接已经在池里之后它不会再执行, 这样下面的开关就只会命中目标命令
+            assertEquals("ok", backend.executeCommand("echo ok", "", 10_000, null).stdout.trim())
             // cat 等着读 stdin, 远端 channel 不清理就会一直留着
+            delayNextExec.set(true)
             assertThrows(Exception::class.java) {
                 backend.executeCommand("cat # $SLOW_REPLY_MARKER", "", 10_000, null)
             }
@@ -523,7 +531,7 @@ class SshWorkspaceBackendTest {
         shell.outputStream.flush()
 
         // 测试服务器没有真正的 PTY, shell 读完 stdin 里的命令后退出
-        val output = shell.inputStream.bufferedReader().readLines()
+        val output = shell.inputStream.bufferedReader().readLines().map { it.stripAnsi() }
         assertEquals(listOf(remoteDir.path, "100 30 xterm-256color"), output)
         assertEquals(3, shell.waitFor())
         assertFalse(shell.connectionLost)
@@ -540,7 +548,7 @@ class SshWorkspaceBackendTest {
             val reader = shell.inputStream.bufferedReader()
             shell.outputStream.write("echo alive\n".toByteArray())
             shell.outputStream.flush()
-            assertEquals("alive", reader.readLine())
+            assertEquals("alive", reader.readLine().stripAnsi())
             shell.resize(columns = 120, rows = 40)
 
             // 关闭后挂断远程 shell, 连接回到空闲状态并被断开
@@ -566,6 +574,12 @@ class SshWorkspaceBackendTest {
 
     private fun sweeperThreads(): Set<Thread> =
         Thread.getAllStackTraces().keys.filter { it.name == "ssh-idle-sweeper" && it.isAlive }.toSet()
+
+    /**
+     * 终端初始化会清屏 (CSI 2J/3J/H)。测试服务器没有真正的 PTY, 这些转义序列会原样出现在
+     * 输出里, 断言前统一剥掉
+     */
+    private fun String.stripAnsi(): String = replace(Regex("\u001B\\[[0-9;]*[A-Za-z]"), "")
 
     private fun waitUntil(timeoutMillis: Long, condition: () -> Boolean): Boolean {
         val deadline = System.currentTimeMillis() + timeoutMillis
